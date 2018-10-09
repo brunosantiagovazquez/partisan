@@ -328,6 +328,14 @@ init([]) ->
         false ->
             ok
     end,
+    
+    %% Schedule periodic execution of xbot algorithm (optimization) when it is enabled
+    case partisan_config:get(xbot, true) of
+		true ->
+			schedule_xbot_execution();
+		false ->
+			ok
+	end,
 
     %% Verify we don't have too many reservations.
     case length(Reservations) > MaxActiveSize of
@@ -599,6 +607,28 @@ handle_info(passive_view_maintenance,
     schedule_passive_view_maintenance(),
 
     {noreply, State};
+    
+% handle optimization using xbot algorithm
+handle_info(xbot_execution,
+				#state{active=Active,
+					   passive=Passive,
+					   max_active_size=MaxActiveSize,
+					   reserved=Reserved}=InitiatorState) ->
+
+	% check if active view is full
+	IsFull = is_full({active,Active,Reserved}, MaxActiveSize),
+	case IsFull of
+		% if full, check for candidates and try to optimize
+		true ->
+			Candidates = select_random_sublist(Passive, 2),
+			send_optimization_messages(Active, Candidates, InitiatorState);
+		% in other case, do nothing
+		false -> ok
+	end,
+
+	%In any case, schedule periodic xbot execution algorithm (optimization)
+	schedule_xbot_execution(),
+	{noreply, InitiatorState};
 
 handle_info({'EXIT', From, Reason},
             #state{myself=Myself,
@@ -1157,7 +1187,158 @@ handle_message({relay_message, Node, Message, TTL} = _RelayMessage, #state{out_l
     {noreply, State};
 handle_message({forward_message, ServerRef, Message}, State) ->
     partisan_util:process_forward(ServerRef, Message),
-    {noreply, State}.
+    {noreply, State};
+    
+
+%% XBOT Algotithm
+
+%% Optimization Reply
+handle_message({optimization_reply, true, _, InitiatorNode, CandidateNode, undefined}, State) ->%#state{active=Active}=State) ->
+	#{name := InitiatorName} = InitiatorNode,
+	#{name := CandidateName} = CandidateNode,
+	lager:debug("XBOT: Received optimization reply message at Node ~p from ~p", [InitiatorName, CandidateName]),
+	%% Revise this behaviour, when candidate accepts inmediatly because it has availability in his active view
+	%% what to do with old node?? we cannot disconnect from it because maybe it will be isolated
+	%Check = is_in_active_view(OldNode, Active),
+	%if Check ->
+		%remove_from_active_view(OldNode, Active),
+		%add_to_passive_view(OldNode, State)
+	%	do_disconnect(OldNode, State)
+	%end,
+	%move_peer_from_passive_to_active(CandidateNode, State),
+	send_join(CandidateNode, State),
+	lager:debug("XBOT: Finished optimization round started by Node ~p ", [InitiatorName]),
+	{noreply, State};
+handle_message({optimization_reply, true, OldNode, InitiatorNode, CandidateNode, _}, #state{active=Active}=State) ->
+	#{name := InitiatorName} = InitiatorNode,
+	#{name := CandidateName} = CandidateNode,
+	lager:debug("XBOT: Received optimization reply message at Node ~p from ~p", [InitiatorName, CandidateName]),
+	Check = is_in_active_view(OldNode, Active),
+	if Check ->
+		%remove_from_active_view(OldNode, Active);
+		do_disconnect(OldNode, State);
+		true -> ok
+	end,
+	%move_peer_from_passive_to_active(CandidateNode, State),
+	send_join(CandidateNode, State),
+	lager:debug("XBOT: Finished optimization round started by Node ~p ", [InitiatorName]),
+	{noreply, State};
+handle_message({optimization_reply, false, _, _, _, _}, State) ->
+	{noreply, State};
+
+%% Optimization
+handle_message({optimization, _, OldNode, InitiatorNode, CandidateNode, undefined},
+					#state{ active=Active, max_active_size=MaxActiveSize, reserved=Reserved, connections=Connections}=State) ->
+	#{name := CandidateName} = CandidateNode,
+	#{name := InitiatorName} = InitiatorNode,
+	lager:debug("XBOT: Received optimization message at Node ~p from ~p", [CandidateName, InitiatorName]),
+	Check = is_full({active, Active, Reserved},MaxActiveSize),
+	if not Check ->
+			%add_to_active_view(CandidateNode, MyTag, State),
+			send_join(InitiatorNode,State),
+			NodeConnections = partisan_util:maybe_connect(InitiatorNode, Connections),
+			do_send_message(InitiatorNode, {optimization_reply, true, OldNode, InitiatorNode, CandidateNode, undefined}, NodeConnections),
+			lager:debug("XBOT: Sending optimization reply message to Node ~p from ~p", [InitiatorName, CandidateName]);
+		true ->
+			DisconnectNode = select_disconnect_node(sets:to_list(Active)),
+			#{name := DisconnectName} = DisconnectNode,
+			NodeConnections = partisan_util:maybe_connect(DisconnectNode, Connections),
+			do_send_message(DisconnectNode,{replace, undefined, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, NodeConnections),
+			lager:debug("XBOT: Sending replace message to Node ~p from ~p", [DisconnectName, CandidateName])
+	end,
+	{noreply, State};
+
+%% Replace Reply
+handle_message({replace_reply, true, OldNode, InitiatorNode, CandidateNode, DisconnectNode},
+			#state{ connections=Connections}=State) ->
+	#{name := InitiatorName} = InitiatorNode,
+	#{name := DisconnectName} = DisconnectNode,
+	#{name := CandidateName} = CandidateNode,
+	lager:debug("XBOT: Received replace reply message at Node ~p from ~p", [CandidateName, DisconnectName]),
+	%remove_from_active_view(DisconnectNode, Active),
+	do_disconnect(DisconnectNode, State),
+	%add_to_active_view(InitiatorNode, MyTag, State),
+	send_join(InitiatorNode, State),
+	NodeConnections = partisan_util:maybe_connect(InitiatorNode, Connections),
+	do_send_message(InitiatorNode,{optimization_reply, true, OldNode, InitiatorNode, CandidateNode, DisconnectNode},NodeConnections),
+	lager:debug("XBOT: Sending optimization reply to Node ~p from ~p", [InitiatorName, CandidateName]),
+	{noreply, State};
+handle_message({replace_reply, false, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, #state{connections=Connections}=State) ->
+	#{name := InitiatorName} = InitiatorNode,
+	#{name := DisconnectName} = DisconnectNode,
+	#{name := CandidateName} = CandidateNode,
+	lager:debug("XBOT: Received replace reply message at Node ~p from ~p", [CandidateName, DisconnectName]),
+	NodeConnections = partisan_util:maybe_connect(InitiatorNode, Connections),
+	do_send_message(InitiatorNode,{optimization_reply, false, OldNode, InitiatorNode, CandidateNode, DisconnectNode},NodeConnections),
+	lager:debug("XBOT: Sending optimization reply to Node ~p from ~p", [InitiatorName, CandidateName]),
+	{noreply, State};
+
+%% Replace
+handle_message({replace, _, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, #state{connections=Connections}=State) ->
+	#{name := DisconnectName} = DisconnectNode,
+	#{name := CandidateName} = CandidateNode,
+	#{name := OldName} = OldNode,
+	lager:debug("XBOT: Received replace message at Node ~p from ~p", [DisconnectName, CandidateName]),
+	Check = is_better(?XPARAM, OldNode, CandidateNode),
+	if not Check ->
+			NodeConnections = partisan_util:maybe_connect(CandidateNode, Connections),
+			do_send_message(CandidateNode,{replace_reply, false, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, NodeConnections),
+			lager:debug("XBOT: Sending replace reply to Node ~p from ~p", [CandidateName, DisconnectName]);
+		true ->
+			NodeConnections = partisan_util:maybe_connect(OldNode, Connections),
+			do_send_message(OldNode,{switch, undefined, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, NodeConnections),
+			lager:debug("XBOT: Sending switch to Node ~p from ~p", [OldName, DisconnectName])
+	end,
+	{noreply, State};
+
+%% Switch Reply
+handle_message({switch_reply, true, OldNode, InitiatorNode, CandidateNode, DisconnectNode},
+			#state{ connections=Connections}=State) ->
+	#{name := DisconnectName} = DisconnectNode,
+	#{name := CandidateName} = CandidateNode,
+	#{name := OldName} = OldNode,
+	lager:debug("XBOT: Received switch reply message at Node ~p from ~p", [DisconnectName, OldName]),
+	%remove_from_active_view(CandidateNode, Active),
+	do_disconnect(CandidateNode, State),
+	%add_to_active_view(OldNode, MyTag, State),
+	send_join(OldNode, State),
+	NodeConnections = partisan_util:maybe_connect(CandidateNode, Connections),
+	do_send_message(CandidateNode,{replace_reply, true, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, NodeConnections),
+	lager:debug("XBOT: Sending replace reply to Node ~p from ~p", [CandidateName, DisconnectName]),
+	{noreply, State};
+handle_message({switch_reply, false, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, #state{connections=Connections}=State) ->
+	#{name := DisconnectName} = DisconnectNode,
+	#{name := CandidateName} = CandidateNode,
+	#{name := OldName} = OldNode,
+	lager:debug("XBOT: Received switch reply message at Node ~p from ~p", [DisconnectName, OldName]),
+	NodeConnections = partisan_util:maybe_connect(CandidateNode, Connections),
+	do_send_message(CandidateNode, {replace_reply, false, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, NodeConnections),
+	lager:debug("XBOT: Sending replace reply to Node ~p from ~p", [CandidateName, DisconnectName]),
+	{noreply, State};
+
+%% Switch
+handle_message({switch, _, OldNode, InitiatorNode, CandidateNode, DisconnectNode},
+			#state{active=Active, connections=Connections}=State) ->
+	#{name := DisconnectName} = DisconnectNode,
+	#{name := OldName} = OldNode,
+	lager:debug("XBOT: Received switch message at Node ~p from ~p", [OldName, DisconnectName]),
+	Check = is_in_active_view(InitiatorNode, Active),
+	if Check ->
+			%remove_from_active_view(InitiatorNode, Active),
+			do_disconnect(InitiatorNode, State),
+			%add_to_active_view(DisconnectNode, MyTag, State),
+			send_join(DisconnectNode, State),
+			NodeConnections = partisan_util:maybe_connect(DisconnectNode, Connections),
+			do_send_message(DisconnectNode, {switch_reply, true, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, NodeConnections),
+			lager:debug("XBOT: Sending switch reply to Node ~p from ~p", [DisconnectName, OldName]);
+		true ->
+			NodeConnections = partisan_util:maybe_connect(DisconnectNode, Connections),
+			do_send_message(DisconnectNode, {switch_reply, false, OldNode, InitiatorNode, CandidateNode, DisconnectNode}, NodeConnections),
+			lager:debug("XBOT: Sending switch reply to Node ~p from ~p", [DisconnectName, OldName])
+	end,
+	{noreply, State}.
+	
+%% END XBOT Algorithm
 
 %% @private
 zero_epoch() ->
@@ -1860,3 +2041,107 @@ retrieve_outlinks() ->
     end,
 
     OutLinks -- [node()].
+    
+     
+     
+%% XBOT INTERNAL FUNCTIONS 
+
+%% @private
+schedule_xbot_execution() ->
+    Interval = partisan_config:get(xbot_interval),
+
+	erlang:send_after(Interval,
+				  	  ?MODULE,
+					  xbot_execution).
+					  
+% Send optimization messages when apply
+%% @private
+send_optimization_messages(_, [], _) -> ok;
+send_optimization_messages(Active, [Candidate | RestCandidates], InitiatorState) ->
+	% check the first candidate against every node in the active view
+	process_candidate(sets:to_list(Active), Candidate, InitiatorState),
+	% do same for every candidate against the active
+	send_optimization_messages(Active, RestCandidates, InitiatorState).
+
+% check if a candidate is valid and send message to try optimization
+% we only send an optimization messages for one node in active view, once we have sent it we stop searching possibilities
+%% @private
+process_candidate([], _, _) -> ok;
+process_candidate([OldNode | RestActiveNodes], CandidateNode, #state{myself=InitiatorNode, connections=Connections}=InitiatorState) ->
+	#{name := InitiatorName} = InitiatorNode,
+	#{name := CandidateName} = CandidateNode,
+	IsBetter = is_better(?XPARAM, CandidateNode, OldNode),
+	if IsBetter ->
+		NodeConnections = partisan_util:maybe_connect(CandidateNode, Connections),
+		% if cadidate is better that first node in active view, send optimization message
+		do_send_message(CandidateNode,{optimization, undefined, OldNode, InitiatorNode, CandidateNode, undefined},NodeConnections),
+		lager:debug("XBOT: Optimization message sent to Node ~p from ~p", [CandidateName, InitiatorName]);
+	   true ->
+	    % if not, continue checking against the remaining nodes in active view
+		process_candidate(RestActiveNodes, CandidateNode, InitiatorState)
+	end.
+	
+%% Determine if New node is better than Old node based on ping (latency)
+%% @private
+is_better(latency, #{name := NewNodeName}, #{name := OldNodeName}) ->
+	is_better_node_by_latency(timer:tc(net_adm, ping, [NewNodeName]), timer:tc(net_adm, ping, [OldNodeName]));
+is_better(_, _, _) ->
+	true.
+
+%% @private
+is_better_node_by_latency({_, pang}, {_, _}) ->
+	%% if we do not get ping response from new node
+	false;
+is_better_node_by_latency({_, pong}, {_, pang}) ->
+	%% if we cannot get response from old node but we got response from new (this should never happen, in general)
+	true;
+is_better_node_by_latency({NewTime, pong}, {OldTime, pong}) ->
+	lager:debug("XBOT: Checking is better - OldTime ~p - NewTime ~p", [OldTime, NewTime]),
+	%% otherwise check lower ping response
+	(OldTime-NewTime) > 0.
+
+%% @private
+select_disconnect_node([H | T]) ->
+	select_worst_in_active_view(T, H).
+
+%% @private
+select_worst_in_active_view([], Worst) ->
+	Worst;
+select_worst_in_active_view([H | T], Worst) ->
+	Check = is_better(?XPARAM, H, Worst),
+	if Check -> select_worst_in_active_view(T, Worst);
+		true -> select_worst_in_active_view(T, H)
+	end.
+	
+%% @private
+send_join(Peer,
+            #state{myself=Myself0,
+                   tag=Tag0,
+                   connections=Connections0,
+                   epoch=Epoch0}=State0) ->
+    %% Trigger connection.
+    Connections = partisan_util:maybe_connect(Peer, Connections0),
+
+    lager:debug("Node ~p sends the JOIN message to ~p", [Myself0, Peer]),
+    %% Send the JOIN message to the peer.
+    do_send_message(Peer,
+                    {join, Myself0, Tag0, Epoch0},
+                    Connections),
+    %% Return.
+    {noreply, State0#state{connections=Connections}}.
+
+%% Send a disconnect message to a peer
+%% @private
+do_disconnect(Peer, #state{active=Active0,
+                                       connections=Connections0}=State0) ->
+    case sets:is_element(Peer, Active0) of
+        true ->
+            %% If a member of the active view, remove it.
+            Active = sets:del_element(Peer, Active0),
+            State = add_to_passive_view(Peer,
+                                        State0#state{active=Active}),
+            Connections = disconnect(Peer, Connections0),
+            {noreply, State#state{connections=Connections}};
+        false ->
+            {noreply, State0}
+    end.

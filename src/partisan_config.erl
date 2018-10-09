@@ -113,6 +113,7 @@ init() ->
                            {tls, false},
                            {tls_options, []},
                            {tag, DefaultTag},
+                           {xbot, ?XBOT_ENABLED},
                            {xbot_interval, XbotInterval}]],
 
     %% Setup default listen addr.
